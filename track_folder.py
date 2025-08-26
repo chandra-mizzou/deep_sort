@@ -6,7 +6,7 @@ import argparse
 import os
 import sys
 import glob
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import cv2
 import numpy as np
@@ -15,6 +15,7 @@ from application_util import preprocessing
 from deep_sort import nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
+from deep_sort.iou_matching import iou
 
 
 def natural_key(string_: str):
@@ -110,22 +111,16 @@ def xyxy_to_tlwh(xyxy: np.ndarray) -> np.ndarray:
 
 def draw_tracks(frame: np.ndarray, tracker: Tracker) -> np.ndarray:
     from application_util.visualization import create_unique_color_uchar
+    # If a label map is provided via closure, use it
+    id_to_label: Dict[int, str] = getattr(draw_tracks, "_id_to_label", {})  # type: ignore[attr-defined]
     for track in tracker.tracks:
         if not track.is_confirmed() or track.time_since_update > 0:
             continue
         x, y, w, h = track.to_tlwh().astype(np.int64)
         color = create_unique_color_uchar(track.track_id)
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(
-            frame,
-            f"ID {track.track_id}",
-            (x, max(0, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+        label = id_to_label.get(track.track_id, f"ID_{track.track_id}")
+        cv2.putText(frame, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
     return frame
 
 
@@ -162,6 +157,11 @@ def process_folder(
 
     writer: Optional[cv2.VideoWriter] = None
 
+    # Class labeling state across frames
+    names: Dict[int, str] = getattr(model, "names", {})  # YOLO class id -> name
+    per_class_counts: Dict[str, int] = {}
+    friendly_label: Dict[int, str] = {}  # track_id -> friendly label like person_1
+
     for idx, img_path in enumerate(image_paths):
         frame = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if frame is None:
@@ -183,6 +183,7 @@ def process_folder(
             # still advance tracker to age out tracks
             tracker.predict()
             tracker.update([])
+            # no detections -> draw with existing labels
             annotated = draw_tracks(frame.copy(), tracker)
             out_path = os.path.join(images_out_dir, os.path.basename(img_path))
             cv2.imwrite(out_path, annotated)
@@ -192,11 +193,13 @@ def process_folder(
 
         xyxy = det.boxes.xyxy.cpu().numpy()
         scores = det.boxes.conf.cpu().numpy().reshape(-1)
+        cls_ids = det.boxes.cls.cpu().numpy().astype(int).reshape(-1)
 
         # filter by confidence
         mask = scores >= conf_thres
         xyxy = xyxy[mask]
         scores = scores[mask]
+        cls_ids = cls_ids[mask]
 
         if xyxy.size == 0:
             tracker.predict()
@@ -222,6 +225,7 @@ def process_folder(
         tlwh = tlwh[indices]
         scores = scores[indices]
         features = np.asarray(features)[indices]
+        cls_ids = cls_ids[indices]
 
         detections: List[Detection] = []
         for i in range(len(tlwh)):
@@ -230,6 +234,29 @@ def process_folder(
         # Tracker step
         tracker.predict()
         tracker.update(detections)
+
+        # Resolve class per track using IoU with current frame detections
+        track_id_to_class: Dict[int, str] = {}
+        if len(tlwh) > 0:
+            for track in tracker.tracks:
+                if not track.is_confirmed() or track.time_since_update > 0:
+                    continue
+                tb = track.to_tlwh()
+                j = int(np.argmax(iou(tb, tlwh)))
+                cname = names.get(int(cls_ids[j]), "obj") if isinstance(names, dict) else str(int(cls_ids[j]))
+                track_id_to_class[track.track_id] = cname
+
+        # Assign stable friendly labels per class (person_1, car_1, ...)
+        for tid, cname in track_id_to_class.items():
+            if tid not in friendly_label:
+                count = per_class_counts.get(cname, 0) + 1
+                per_class_counts[cname] = count
+                friendly_label[tid] = f"{cname}_{count}"
+
+        # Provide label map to drawing function via attribute
+        label_map = {t.track_id: friendly_label.get(t.track_id, f"ID_{t.track_id}")
+                     for t in tracker.tracks if t.is_confirmed() and t.time_since_update == 0}
+        setattr(draw_tracks, "_id_to_label", label_map)  # type: ignore[attr-defined]
 
         # Visualization and save
         annotated = draw_tracks(frame.copy(), tracker)
