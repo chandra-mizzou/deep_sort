@@ -137,6 +137,7 @@ def process_folder(
     video_filename: Optional[str],
     fps: int,
     imgsz: int,
+    interactive: bool,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     images_out_dir = os.path.join(output_dir, "images")
@@ -162,9 +163,20 @@ def process_folder(
     per_class_counts: Dict[str, int] = {}
     friendly_label: Dict[int, str] = {}  # track_id -> friendly label like person_1
 
-    for idx, img_path in enumerate(image_paths):
+    # Interactive state
+    selected_label_text: Optional[str] = None
+    track_only_selected: bool = False
+    paused: bool = False
+    if interactive:
+        cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
+
+    idx = 0
+    while idx < len(image_paths):
+        img_path = image_paths[idx]
         frame = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if frame is None:
+            if not interactive:
+                idx += 1
             continue
         height, width = frame.shape[:2]
 
@@ -189,6 +201,20 @@ def process_folder(
             cv2.imwrite(out_path, annotated)
             if writer is not None:
                 writer.write(annotated)
+            if not interactive:
+                idx += 1
+            else:
+                cv2.imshow("Tracking", annotated)
+            # Handle interactive keys even when no detections
+            if interactive:
+                key = cv2.waitKeyEx(30) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('p'):
+                    paused = not paused
+                elif key == ord('c'):
+                    # command mode even if no dets
+                    _handle_command_interactive(selected_label_text, track_only_selected)
             continue
 
         xyxy = det.boxes.xyxy.cpu().numpy()
@@ -258,15 +284,113 @@ def process_folder(
                      for t in tracker.tracks if t.is_confirmed() and t.time_since_update == 0}
         setattr(draw_tracks, "_id_to_label", label_map)  # type: ignore[attr-defined]
 
+        # Interactive selection: highlight selected and optionally filter display to only selected
+        if interactive:
+            # Determine if selected label is currently present and alive (<=3 missed frames)
+            if selected_label_text is not None:
+                # Find matching track id for selected label
+                selected_ids = [tid for tid, lbl in label_map.items() if lbl == selected_label_text]
+                selected_present = False
+                if selected_ids:
+                    # Check if the selected track is alive
+                    for t in tracker.tracks:
+                        if t.track_id == selected_ids[0]:
+                            if t.is_confirmed() and t.time_since_update <= 3:
+                                selected_present = True
+                            break
+                if not selected_present and track_only_selected:
+                    # Selected target lost
+                    track_only_selected = False
+                    selected_label_text = None
+
+            # Pass selected label to drawer for highlighting
+            setattr(draw_tracks, "_selected_label_text", selected_label_text)  # type: ignore[attr-defined]
+
         # Visualization and save
-        annotated = draw_tracks(frame.copy(), tracker)
+        if interactive and track_only_selected and selected_label_text is not None:
+            # Temporarily hide non-selected by blanking their labels
+            # We draw all but overlay a mask to only show selected's label; for simplicity, filter label map
+            filtered_ids = {tid for tid, lbl in label_map.items() if lbl == selected_label_text}
+            tmp_label_map = {tid: lbl for tid, lbl in label_map.items() if tid in filtered_ids}
+            setattr(draw_tracks, "_id_to_label", tmp_label_map)  # type: ignore[attr-defined]
+            annotated = draw_tracks(frame.copy(), tracker)
+            setattr(draw_tracks, "_id_to_label", label_map)  # restore
+        else:
+            annotated = draw_tracks(frame.copy(), tracker)
         out_path = os.path.join(images_out_dir, os.path.basename(img_path))
         cv2.imwrite(out_path, annotated)
         if writer is not None:
             writer.write(annotated)
 
+        if not interactive:
+            idx += 1
+            continue
+
+        # Show and handle interactive keys
+        cv2.imshow("Tracking", annotated)
+        key = cv2.waitKeyEx(30) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('p'):
+            paused = not paused
+        elif key == ord('c'):
+            # Enter command: track <description> | reset | quit
+            print("\n[COMMAND] Available labels:", list(label_map.values()))
+            print("Enter command: 'track <description>' | 'reset' | 'quit'")
+            try:
+                cmd = input(">> ").strip()
+            except EOFError:
+                cmd = ""
+            cmd_l = cmd.lower()
+            if cmd_l == "quit":
+                break
+            elif cmd_l == "reset":
+                track_only_selected = False
+                selected_label_text = None
+                print("[INFO] Reset. Tracking all targets.")
+            elif cmd_l.startswith("track"):
+                parts = cmd.split(" ", 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    print("[WARN] Provide a description, e.g., 'track red car'")
+                else:
+                    desc = parts[1].strip()
+                    # Lazy-load BERT and compute similarity to label strings
+                    try:
+                        import torch
+                        from transformers import BertTokenizer, BertModel
+                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+                        bert = BertModel.from_pretrained("bert-base-uncased").eval().to(device)
+                        with torch.no_grad():
+                            tokens = tokenizer(desc, return_tensors="pt").to(device)
+                            desc_emb = bert(**tokens).last_hidden_state.mean(dim=1)  # (1, hidden)
+                            best_lbl, best_sim = None, -1.0
+                            for lbl in label_map.values():
+                                t2 = tokenizer(lbl, return_tensors="pt").to(device)
+                                lbl_emb = bert(**t2).last_hidden_state.mean(dim=1)
+                                sim = torch.cosine_similarity(desc_emb, lbl_emb, dim=1).item()
+                                if sim > best_sim:
+                                    best_sim = sim
+                                    best_lbl = lbl
+                        if best_lbl is not None:
+                            selected_label_text = best_lbl
+                            track_only_selected = True
+                            print(f"[INFO] Tracking only '{selected_label_text}' (sim={best_sim:.2f})")
+                        else:
+                            print("[WARN] No match found.")
+                    except Exception as e:
+                        print(f"[ERROR] BERT selection failed: {e}")
+
+        if not paused:
+            idx += 1
+
     if writer is not None:
         writer.release()
+    if interactive:
+        try:
+            cv2.destroyWindow("Tracking")
+        except Exception:
+            pass
 
 
 def parse_args():
@@ -283,6 +407,7 @@ def parse_args():
     parser.add_argument("--video_filename", default=None, help="Optional output video filename (mp4)")
     parser.add_argument("--fps", type=int, default=30, help="Output video FPS")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
+    parser.add_argument("--interactive", action="store_true", help="Enable interactive window with BERT-based selection")
     return parser.parse_args()
 
 
@@ -301,6 +426,7 @@ def main():
         video_filename=args.video_filename,
         fps=args.fps,
         imgsz=args.imgsz,
+        interactive=args.interactive,
     )
 
 
