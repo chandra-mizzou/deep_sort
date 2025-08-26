@@ -141,6 +141,7 @@ def process_folder(
     save_video: bool,
     video_filename: Optional[str],
     fps: int,
+    imgsz: int,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     images_out_dir = os.path.join(output_dir, "images")
@@ -175,7 +176,7 @@ def process_folder(
             writer = cv2.VideoWriter(video_filename, fourcc, fps, (width, height))
 
         # YOLO inference
-        results = model(frame, imgsz=None, verbose=False)
+        results = model(frame, imgsz=imgsz, verbose=False)
         det = results[0]
         # det.boxes.xyxy: (N,4), det.boxes.conf: (N,1)
         if det.boxes is None or len(det.boxes) == 0:
@@ -254,6 +255,7 @@ def parse_args():
     parser.add_argument("--save_video", action="store_true", help="Save compiled tracking video to output_dir")
     parser.add_argument("--video_filename", default=None, help="Optional output video filename (mp4)")
     parser.add_argument("--fps", type=int, default=30, help="Output video FPS")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     return parser.parse_args()
 
 
@@ -271,6 +273,7 @@ def main():
         save_video=args.save_video,
         video_filename=args.video_filename,
         fps=args.fps,
+        imgsz=args.imgsz,
     )
 
 
