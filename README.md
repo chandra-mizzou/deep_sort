@@ -51,6 +51,25 @@ Check `python deep_sort_app.py -h` for an overview of available options.
 There are also scripts in the repository to visualize results, generate videos,
 and evaluate the MOT challenge benchmark.
 
+## Track an arbitrary image folder (YOLOv8 + DeepSORT)
+
+If you want to run detection + DeepSORT tracking on a plain folder of images (no MOT format), use `track_folder.py`:
+
+```
+pip install -r requirements.txt
+python track_folder.py \
+  --input_dir=/path/to/images \
+  --output_dir=/path/to/output \
+  --save_video
+```
+
+Notes:
+
+- By default, YOLOv8n is used for detection and a color-histogram encoder is used for appearance features. To use the original DeepSORT ReID, pass a TensorFlow `.pb` model (e.g., `mars-small128.pb`) via `--reid_model` if you have TensorFlow installed.
+- Outputs:
+  - Annotated frames in `output_dir/images`
+  - Optional video in `output_dir/tracks.mp4` (or `--video_filename`)
+
 ## Generating detections
 
 Beside the main tracking application, this repository contains a script to
